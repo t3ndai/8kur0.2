@@ -86,6 +86,35 @@ type (
 		Username string `json:"username"`
 		Token    string `json:"token"`
 	}
+
+	UserResponse struct {
+		Id        string    `json:"id"`
+		Username  string    `json:"username"`
+		Email     string    `json:"email"`
+		CreatedAt time.Time `json:"createdAt"`
+		UpdatedAt time.Time `json:"updatedAt"`
+	}
+
+	WebItemResponse struct {
+		Id     string    `json:"id"`
+		Url    string    `json:"url"`
+		Body   string    `json:"body"`
+		Source string    `json:"source"`
+		Age    time.Time `json:"age"`
+	}
+
+	CollectionResponse struct {
+		Id         string    `json:"id"`
+		Curator    string    `json:"name"`
+		CreatedAt  time.Time `json:"createdAt"`
+		UpdatedAt  time.Time `json:"updatedAt"`
+		Visibility bool      `json:"private"`
+	}
+
+	HomeResponse struct {
+		User        UserResponse         `json:"user"`
+		Collections []CollectionResponse `json:"collections"`
+	}
 )
 
 // validation
@@ -281,6 +310,55 @@ func login(db *sql.DB, username string) (u User, err error) {
 	}
 }
 
+func home(db *sql.DB, userId string) error {
+	if userId != "" {
+		const userQuery = `SELECT id, username
+		FROM users
+		WHERE user_id = ?`
+		const userItemsQuery = `SELECT w.id, w.url, COALESCE(w.source, ''), w.body, w.age, c.id, c.curator, c.created_at, c.updated_at, c.visibility
+		FROM web_items w, collections c, web_collections wc
+		WHERE w.user_id = ?
+		AND   c.user_id=w.user_id
+		AND   wc.collection_id = c.id 
+		AND   wc.web_item_id = w.id
+		`
+		userResponse := &UserResponse{}
+		collections := []CollectionResponse{}
+		err := db.QueryRow(userQuery, userId).Scan(&userResponse.Id, &userResponse.Username)
+
+		switch {
+		case err == sql.ErrNoRows:
+			log.Errorf("no data for user %v", userId)
+		case err != nil:
+			log.Errorf("ran into error getting user data %v", userId)
+		default:
+			log.Printf("user found")
+		}
+
+		rows, err := db.Query(userItemsQuery, userId)
+		if err != nil {
+			log.Errorf("could not return user web_items / collections query %v", err)
+			return err
+		}
+
+		for rows.Next() {
+			var (
+				collection CollectionResponse
+				webItem    WebItemResponse
+			)
+			if err := rows.Scan(&webItem.Id, &webItem.Url, &webItem.Source, &webItem.Body, &webItem.Age, &collection.Id, &collection.Curator, &collection.CreatedAt, &collection.UpdatedAt, &collection.Visibility); err != nil {
+				log.Errorf("could not retrieve rows %v", err)
+				return err
+			}
+			collections = append(collections, collection)
+			log.Printf("item %v, in collection %v", webItem, collection)
+		}
+		return nil
+
+	}
+	return nil
+}
+
 /* func getSession(db *sql.DB, key string) (string, error) {
 	var userId string
 	stmt, err := db.Prepare(`
@@ -401,6 +479,15 @@ func (h *Handler) loginHandler(c echo.Context) error {
 	return c.NoContent(http.StatusOK)
 }
 
+func (h *Handler) homeHandler(c echo.Context) error {
+	if userId, ok := c.Get("currentUser").(string); ok {
+		user := User{id: userId}
+		home(h.DB, user.id)
+		return c.NoContent(http.StatusOK)
+	}
+	return nil
+}
+
 func (h *Handler) importFromHN(c echo.Context) error {
 	hnImportDetails := new(HNImportDetails)
 	if err := c.Bind(hnImportDetails); err != nil {
@@ -430,9 +517,10 @@ func (h *Handler) importFromHN(c echo.Context) error {
 }
 
 func authenticate(next echo.HandlerFunc) echo.HandlerFunc {
-	log.Printf("called")
 	return func(c echo.Context) error {
-		if c.Path() != "/login" || c.Path() != "/signup" {
+		log.Printf("path %v", c.Path() == "/login")
+		if c.Path() != "/login" && c.Path() != "/signup" {
+			log.Printf("called from IF")
 			sess, err := session.Get("session", c)
 			currentUser := sess.Values["currentUser"]
 			c.Set("currentUser", currentUser)
@@ -447,8 +535,10 @@ func authenticate(next echo.HandlerFunc) echo.HandlerFunc {
 
 func CorsHeader(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
+		c.Response().Header().Set("Access-Control-Allow-Origin", "http://localhost:5175/")
+		c.Response().Header().Set("Access-Control-Allow-Origin", "http://localhost:5175/")
 		c.Response().Header().Set("Access-Control-Allow-Origin", "*")
-		c.Response().Header().Set("Access-Control-Allow-Origin", "http://localhost:5174")
+		c.Response().Header().Set("Access-Control-Allow-Origin", "http://localhost:5175")
 		return next(c)
 	}
 }
@@ -470,7 +560,7 @@ func main() {
 	e.Use(CorsHeader)
 	//e.Use(middleware.CORS())
 	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
-		AllowOrigins:     []string{"http://localhost:5174", "*"},
+		AllowOrigins:     []string{"http://localhost:5174", "http://localhost:5175", "*"},
 		AllowMethods:     []string{http.MethodGet, http.MethodPut, http.MethodPost, http.MethodDelete, http.MethodOptions},
 		AllowCredentials: true,
 		AllowHeaders: []string{
@@ -496,5 +586,6 @@ func main() {
 	e.POST("/login", h.loginHandler)
 	e.POST("/signup", h.signupHandler)
 	e.POST("/hn-import", h.importFromHN)
+	e.GET("/home", h.homeHandler)
 	e.Logger.Fatal(e.Start(":1323"))
 }
