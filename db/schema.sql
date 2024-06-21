@@ -1,3 +1,4 @@
+/* this might get outdated == if dev machine does not have pgdump */
 CREATE TABLE IF NOT EXISTS "schema_migrations" (version varchar(128) primary key);
 CREATE TABLE users(
     id char(26) primary key,

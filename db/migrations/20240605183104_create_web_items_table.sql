@@ -1,13 +1,12 @@
 -- migrate:up
 create table if not exists web_items(
     id char(26) primary key,
-    url varchar(255) not null,
-    source varchar(255),
-    body text,
     user_id char(26),
-    age datetime,
-    FOREIGN KEY(user_id) REFERENCES users(id) on delete set null ,
-    unique(url, user_id)
+    collection_id char(26) not null,
+    url varchar(255),
+    data jsonb,
+    FOREIGN KEY(user_id) REFERENCES users(id) on delete set null,
+    UNIQUE(collection_id, url)
 );
 
 -- migrate:down

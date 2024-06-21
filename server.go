@@ -5,13 +5,18 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"os"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 
+	"context"
+
 	"github.com/go-playground/validator/v10"
 	"github.com/go-rod/rod"
 	"github.com/gorilla/sessions"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 	"github.com/labstack/echo-contrib/session"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
@@ -37,20 +42,22 @@ type Session struct {
 }
 
 type WebItem struct {
-	id     string
-	url    string
-	body   string
-	age    time.Time
-	userId string
+	Id           string    `json:"id"`
+	Url          string    `json:"url"`
+	Body         string    `json:"body"`
+	Age          time.Time `json:"age"`
+	UserId       string    `json:"userId"`
+	CollectionId []string  `json:"collectionId"`
 }
 
 type Collection struct {
-	id         string
-	curator    string
-	createdAt  time.Time
-	updatedAt  time.Time
-	visibility bool
-	userId     string
+	Id         string    `json:"id"`
+	Curator    string    `json:"curator"`
+	CreatedAt  time.Time `json:"createdAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+	Visibility bool      `json:"visibility"`
+	UserId     string    `json:"userId"`
+	Score      float64   `json:"score"`
 }
 
 type HnWorkItem struct {
@@ -96,24 +103,20 @@ type (
 	}
 
 	WebItemResponse struct {
-		Id     string    `json:"id"`
-		Url    string    `json:"url"`
-		Body   string    `json:"body"`
-		Source string    `json:"source"`
-		Age    time.Time `json:"age"`
+		Id   string `json:"id"`
+		Data string `json:"data"`
 	}
 
 	CollectionResponse struct {
-		Id         string    `json:"id"`
-		Curator    string    `json:"name"`
-		CreatedAt  time.Time `json:"createdAt"`
-		UpdatedAt  time.Time `json:"updatedAt"`
-		Visibility bool      `json:"private"`
+		Id       string             `json:"id"`
+		Curator  string             `json:"name"`
+		Data     string             `json:"data"`
+		WebItems []*WebItemResponse `json:"items"`
 	}
 
 	HomeResponse struct {
-		User        UserResponse         `json:"user"`
-		Collections []CollectionResponse `json:"collections"`
+		User        UserResponse          `json:"user"`
+		Collections []*CollectionResponse `json:"collections"`
 	}
 )
 
@@ -151,54 +154,49 @@ func msgForTag(tag string) string {
 // Core Functionality
 //---------
 
-func createUser(db *sql.DB, user User) error {
+func createUser(ctx context.Context, db *pgxpool.Pool, user User) error {
 
-	stmt, err := db.Prepare("INSERT INTO users(id,username, email, password_digest) VALUES (?, ?, ?, ?)")
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
+	cctx, cancel := context.WithTimeout(ctx, time.Second*2)
+	defer cancel()
+	stmt := "INSERT INTO users(id,username, email, password_digest) VALUES ($1, $2, $3, $4)"
 
-	if _, err := stmt.Exec(user.id, user.username, user.email, user.password_digest); err != nil {
+	if _, err := db.Exec(cctx, stmt, user.id, user.username, user.email, user.password_digest); err != nil {
+		log.Errorf("error - creating user %v", err)
 		return err
 	}
 	return nil
 }
 
-/* func createSession(db *sql.DB, session Session) error {
-	stmt, err := db.Prepare("INSERT INTO sessions(id, user_id, expires_at) VALUES (?, ?, ?)")
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
+func (workItem *HnWorkItem) hnImportProcessing(ctx context.Context, db *pgxpool.Pool) error {
 
-	if _, err := stmt.Exec(session.id, session.userId, session.expiresAt); err != nil {
-		return err
-	}
-	return nil
-} */
+	cctx, cancel := context.WithTimeout(ctx, time.Second*2)
+	defer cancel()
 
-func (workItem *HnWorkItem) hnImportProcessing(db *sql.DB) error {
-	const createCollectionQuery = `
-		INSERT OR IGNORE INTO collections(id, curator, user_id, visibility) VALUES (?, ?, ?, ?)
+	createCollectionQuery := `
+		INSERT INTO collections(id, user_id, curator, data) 
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (user_id, curator)
+		DO NOTHING
 		RETURNING id
 	`
-	const createWebItemQuery = `
-		INSERT OR IGNORE INTO web_items(id, url, body, age, user_id) VALUES (?, ?, ?, ?, ?)
+	createWebItemQuery := `
+		INSERT INTO web_items(id, user_id, collection_id, url, data) 
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (collection_id, url) 
+		DO NOTHING
 		RETURNING id
 	`
-	const createWebColletionsQuery = `
-		INSERT OR IGNORE INTO web_collections(web_item_id, collection_id) VALUES (?, ?)
-	`
-	tx, err := db.Begin()
+
+	tx, err := db.Begin(cctx)
 	if err != nil {
+		log.Errorf("failed to start db transaction, %v", err)
 		return err
 	}
-	defer tx.Rollback()
-	collection := Collection{id: ulid.Make().String(), curator: workItem.curator, visibility: false, userId: workItem.userId}
-	collectionCreateError := tx.QueryRow(createCollectionQuery, collection.id, collection.curator, collection.userId, collection.visibility).Scan(&collection.id)
+	defer tx.Rollback(cctx)
+	collection := Collection{Id: ulid.Make().String(), Curator: workItem.curator, Visibility: false, UserId: workItem.userId, CreatedAt: time.Now(), UpdatedAt: time.Now()}
+	collectionCreateError := tx.QueryRow(cctx, createCollectionQuery, collection.Id, collection.UserId, collection.Curator, collection).Scan(&collection.Id)
 	if collectionCreateError != nil {
-		if rollbackErr := tx.Rollback(); rollbackErr != nil {
+		if rollbackErr := tx.Rollback(cctx); rollbackErr != nil {
 			log.Errorf("failed to create collection %v, failed to rollback %v", collectionCreateError, rollbackErr)
 			return rollbackErr
 		}
@@ -206,26 +204,19 @@ func (workItem *HnWorkItem) hnImportProcessing(db *sql.DB) error {
 		return collectionCreateError
 	}
 	for _, webItem := range workItem.webItems {
-		webItemCreateError := tx.QueryRow(createWebItemQuery, webItem.id, webItem.url, webItem.body, webItem.age, workItem.userId).Scan(&webItem.id)
+		webItem.CollectionId = append(webItem.CollectionId, collection.Id)
+		webItemCreateError := tx.QueryRow(cctx, createWebItemQuery, webItem.Id, workItem.userId, collection.Id, webItem.Url, webItem).Scan(&webItem.Id)
 		if webItemCreateError != nil {
-			if rollbackErr := tx.Rollback(); rollbackErr != nil {
+			if rollbackErr := tx.Rollback(cctx); rollbackErr != nil {
 				log.Errorf("failed to create WebItem %v, failed to rollback %v", webItemCreateError, rollbackErr)
 				return rollbackErr
 			}
 			log.Errorf("failed to create WebItem %v", webItemCreateError)
 			return webItemCreateError
 		}
-		_, webCollectionError := tx.Exec(createWebColletionsQuery, webItem.id, collection.id)
-		if webCollectionError != nil {
-			if rollbackErr := tx.Rollback(); rollbackErr != nil {
-				log.Errorf("failed to create webCollection %v, failed to rollback %v", webCollectionError, rollbackErr)
-				return rollbackErr
-			}
-			log.Errorf("failed to create webCollection %v", webCollectionError)
-			return webCollectionError
-		}
+
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(cctx); err != nil {
 		log.Errorf("failed to create webItems & collecton", err)
 	}
 	return nil
@@ -241,14 +232,11 @@ func generateCommentsList(links rod.Elements) []WebItem {
 	commentsList := []WebItem{}
 
 	for _, link := range links {
-		comment := WebItem{id: ulid.Make().String()}
+		comment := WebItem{Id: ulid.Make().String()}
 		comment.extractComment(link)
 		commentsList = append(commentsList, comment)
 	}
 
-	for _, comment := range commentsList {
-		log.Printf("%+v", comment)
-	}
 	return commentsList
 }
 
@@ -257,7 +245,7 @@ func (c *WebItem) extractComment(link *rod.Element) {
 	if err != nil {
 		log.Printf("could not extract body")
 	}
-	c.body = body.MustText()
+	c.Body = body.MustText()
 	urlElement, _ := link.Element(".age > a")
 	url, err := urlElement.Attribute("href")
 	if err != nil {
@@ -273,32 +261,28 @@ func (c *WebItem) extractComment(link *rod.Element) {
 	if err != nil {
 		log.Errorf("could not parse time")
 	}
-	c.age = ageTime
-	c.url = "https://news.ycombinator.com/" + *url
+	c.Age = ageTime
+	c.Url = "https://news.ycombinator.com/" + *url
 }
 
 //func deleteUser(db {}, user string) {}
 
-func login(db *sql.DB, username string) (u User, err error) {
+func login(ctx context.Context, db *pgxpool.Pool, username string) (u User, err error) {
 	var user User
-	stmt, err := db.Prepare(`
+	stmt := `
 		SELECT id, username, email, password_digest, created_at, updated_at
 		FROM users
-		WHERE username=?
-	`)
+		WHERE username=$1
+	`
+	cctx, cancel := context.WithTimeout(ctx, time.Second*2)
+	defer cancel()
 
-	if err != nil {
-		return User{}, err
-	}
-
-	err = stmt.QueryRow(username).Scan(&user.id,
+	err = db.QueryRow(cctx, stmt, username).Scan(&user.id,
 		&user.username,
 		&user.email,
 		&user.password_digest,
 		&user.created_at,
 		&user.updated_at)
-
-	defer stmt.Close()
 
 	switch {
 	case err == sql.ErrNoRows:
@@ -310,79 +294,130 @@ func login(db *sql.DB, username string) (u User, err error) {
 	}
 }
 
-func home(db *sql.DB, userId string) error {
+func home(ctx context.Context, db *pgxpool.Pool, userId string) (HomeResponse, error) {
+
+	cctx, cancel := context.WithTimeout(ctx, time.Second*2)
+	defer cancel()
+
+	var homeResponse HomeResponse
+	var userResponse UserResponse
+	var collections []*CollectionResponse
+
 	if userId != "" {
-		const userQuery = `SELECT id, username
+
+		userQuery := `SELECT id, username
 		FROM users
-		WHERE user_id = ?`
-		const userItemsQuery = `SELECT w.id, w.url, COALESCE(w.source, ''), w.body, w.age, c.id, c.curator, c.created_at, c.updated_at, c.visibility
-		FROM web_items w, collections c, web_collections wc
-		WHERE w.user_id = ?
-		AND   c.user_id=w.user_id
-		AND   wc.collection_id = c.id 
-		AND   wc.web_item_id = w.id
+		WHERE id = $1`
+
+		userCollectionsQuery := ` SELECT id, curator, data
+		FROM collections
+		WHERE user_id = $1
 		`
-		userResponse := &UserResponse{}
-		collections := []CollectionResponse{}
-		err := db.QueryRow(userQuery, userId).Scan(&userResponse.Id, &userResponse.Username)
 
-		switch {
-		case err == sql.ErrNoRows:
-			log.Errorf("no data for user %v", userId)
-		case err != nil:
-			log.Errorf("ran into error getting user data %v", userId)
-		default:
-			log.Printf("user found")
-		}
+		webItemsInCollectionQuery := `SELECT id, data
+		FROM web_items 
+		WHERE collection_id = $1
+		`
 
-		rows, err := db.Query(userItemsQuery, userId)
+		tx, err := db.Begin(cctx)
 		if err != nil {
-			log.Errorf("could not return user web_items / collections query %v", err)
-			return err
+			log.Errorf("could not start db transaction, %v", err)
+		}
+		defer tx.Rollback(cctx)
+
+		userFetchErr := db.QueryRow(cctx, userQuery, userId).Scan(&userResponse.Id, &userResponse.Username)
+
+		if userFetchErr != nil {
+			if rollbackErr := tx.Rollback(cctx); rollbackErr != nil {
+				log.Errorf("failed to get user %v, failed to rollback %v", userFetchErr, rollbackErr)
+				return HomeResponse{}, rollbackErr
+			}
+			log.Errorf("failed to get user %v", userFetchErr)
+			return HomeResponse{}, userFetchErr
 		}
 
-		for rows.Next() {
-			var (
-				collection CollectionResponse
-				webItem    WebItemResponse
-			)
-			if err := rows.Scan(&webItem.Id, &webItem.Url, &webItem.Source, &webItem.Body, &webItem.Age, &collection.Id, &collection.Curator, &collection.CreatedAt, &collection.UpdatedAt, &collection.Visibility); err != nil {
-				log.Errorf("could not retrieve rows %v", err)
-				return err
+		collectionRows, collectionFetchErr := db.Query(cctx, userCollectionsQuery, userId)
+
+		if collectionFetchErr != nil {
+			if rollbackErr := tx.Rollback(cctx); rollbackErr != nil {
+				log.Errorf("failed to get collections %v, failed to rollback %v", collectionFetchErr, rollbackErr)
+				return HomeResponse{}, rollbackErr
+			}
+			log.Errorf("failed to get collections %v", collectionFetchErr)
+			return HomeResponse{}, collectionFetchErr
+		}
+
+		defer collectionRows.Close()
+
+		for collectionRows.Next() {
+			collection := &CollectionResponse{}
+			rowErr := collectionRows.Scan(&collection.Id, &collection.Curator, &collection.Data)
+			if rowErr != nil {
+				if rollbackErr := tx.Rollback(cctx); rollbackErr != nil {
+					log.Errorf("failed to scan collections %v, failed to rollback %v", rowErr, rollbackErr)
+					return HomeResponse{}, rollbackErr
+				}
+				log.Errorf("failed to scan collections %v", rowErr)
+				return HomeResponse{}, rowErr
 			}
 			collections = append(collections, collection)
-			log.Printf("item %v, in collection %v", webItem, collection)
 		}
-		return nil
 
+		if collectionRows.Err() != nil {
+			if rollbackErr := tx.Rollback(cctx); rollbackErr != nil {
+				log.Errorf("collection row error %v, failed to rollback %v", collectionRows.Err(), rollbackErr)
+				return HomeResponse{}, rollbackErr
+			}
+			log.Errorf("collection row error %v", collectionRows.Err())
+			return HomeResponse{}, collectionRows.Err()
+		}
+
+		for _, collection := range collections {
+
+			webItemRows, webItemFetchErr := tx.Query(cctx, webItemsInCollectionQuery, collection.Id)
+
+			if webItemFetchErr != nil {
+				if rollbackErr := tx.Rollback(cctx); rollbackErr != nil {
+					log.Errorf("failed to get webItems %v, failed to rollback %v", webItemFetchErr, rollbackErr)
+					return HomeResponse{}, rollbackErr
+				}
+				log.Errorf("failed to get webItems %v", webItemFetchErr)
+				return HomeResponse{}, webItemFetchErr
+			}
+
+			defer webItemRows.Close()
+
+			for webItemRows.Next() {
+				var webItem WebItemResponse
+				var webItems []*WebItemResponse
+				rowErr := webItemRows.Scan(&webItem.Id, &webItem.Data)
+				if rowErr != nil {
+					if rollbackErr := tx.Rollback(cctx); rollbackErr != nil {
+						log.Errorf("failed to scan webItem row %v, failed to rollback %v", rowErr, rollbackErr)
+						return HomeResponse{}, rollbackErr
+					}
+					log.Errorf("failed to scan webItem row %v", rowErr)
+					return HomeResponse{}, rowErr
+				}
+				webItems = append(webItems, &webItem)
+				collection.WebItems = append(collection.WebItems, webItems...)
+			}
+
+			if webItemRows.Err() != nil {
+				if rollackErr := tx.Rollback(cctx); rollackErr != nil {
+					log.Errorf("webItems row error %v, failed to rollback %v", webItemRows.Err(), rollackErr)
+					return HomeResponse{}, rollackErr
+				}
+				log.Errorf("webItems row error %v", webItemRows.Err())
+				return HomeResponse{}, webItemRows.Err()
+			}
+		}
+		homeResponse.User = userResponse
+		homeResponse.Collections = collections
+		return homeResponse, nil
 	}
-	return nil
+	return HomeResponse{}, nil
 }
-
-/* func getSession(db *sql.DB, key string) (string, error) {
-	var userId string
-	stmt, err := db.Prepare(`
-		SELECT user_id
-		FROM sessions
-		WHERE id=?
-	`)
-	if err != nil {
-		return "", err
-	}
-
-	err = stmt.QueryRow(key).Scan(&userId)
-
-	defer stmt.Close()
-
-	switch {
-	case err == sql.ErrNoRows:
-		return "", err
-	case err != nil:
-		return "", err
-	default:
-		return userId, nil
-	}
-} */
 
 // --------
 // Helpers
@@ -402,7 +437,7 @@ func home(db *sql.DB, userId string) error {
 //---------
 
 type Handler struct {
-	DB *sql.DB
+	DB *pgxpool.Pool
 }
 
 func (h *Handler) signupHandler(c echo.Context) error {
@@ -427,8 +462,10 @@ func (h *Handler) signupHandler(c echo.Context) error {
 		password_digest: string(hashedPassword),
 	}
 
+	ctx := context.Background()
+
 	// save user
-	if err := createUser(h.DB, user); err != nil {
+	if err := createUser(ctx, h.DB, user); err != nil {
 		return c.NoContent(http.StatusInternalServerError)
 	}
 
@@ -443,7 +480,10 @@ func (h *Handler) loginHandler(c echo.Context) error {
 	if err := c.Validate(loginDetails); err != nil {
 		return err
 	}
-	user, err := login(h.DB, loginDetails.Username)
+
+	ctx := context.Background()
+
+	user, err := login(ctx, h.DB, loginDetails.Username)
 	if err != nil {
 		return c.NoContent(http.StatusInternalServerError)
 	}
@@ -451,10 +491,6 @@ func (h *Handler) loginHandler(c echo.Context) error {
 	if err != nil {
 		return c.NoContent(http.StatusUnauthorized)
 	}
-
-	//token := generateToken()
-	//expiryTime := time.Now().Add(time.Hour * 24)
-	//session := Session{id: token, userId: user.id, expiresAt: expiryTime}
 
 	sess, err := session.Get("session", c)
 	if err != nil {
@@ -470,20 +506,18 @@ func (h *Handler) loginHandler(c echo.Context) error {
 		return err
 	}
 
-	/* if err := createSession(h.DB, session); err != nil {
-		return c.NoContent(http.StatusInternalServerError)
-	} */
-
-	//loginResponse := LoginResponse{Token: token, Username: user.username}
-	//return c.JSON(http.StatusOK, loginResponse)
 	return c.NoContent(http.StatusOK)
 }
 
 func (h *Handler) homeHandler(c echo.Context) error {
+	ctx := context.Background()
 	if userId, ok := c.Get("currentUser").(string); ok {
 		user := User{id: userId}
-		home(h.DB, user.id)
-		return c.NoContent(http.StatusOK)
+		homeResponse, err := home(ctx, h.DB, user.id)
+		if err != nil {
+			return c.NoContent(http.StatusInternalServerError)
+		}
+		return c.JSON(http.StatusOK, homeResponse)
 	}
 	return nil
 }
@@ -501,13 +535,16 @@ func (h *Handler) importFromHN(c echo.Context) error {
 	if err != nil {
 		return err
 	}
+
+	ctx := context.Background()
+
 	query := parsedUrl.Query()
 	curator := query.Get("id")
 	comments := getHNComments(u)
 	if userId, ok := c.Get("currentUser").(string); ok {
 		user := User{id: userId}
 		workItem := &HnWorkItem{curator: curator, webItems: comments, userId: user.id}
-		workItem.hnImportProcessing(h.DB)
+		workItem.hnImportProcessing(ctx, h.DB)
 	}
 
 	// do this in background later
@@ -518,11 +555,11 @@ func (h *Handler) importFromHN(c echo.Context) error {
 
 func authenticate(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		log.Printf("path %v", c.Path() == "/login")
 		if c.Path() != "/login" && c.Path() != "/signup" {
 			log.Printf("called from IF")
 			sess, err := session.Get("session", c)
 			currentUser := sess.Values["currentUser"]
+			log.Printf("current User %v", currentUser)
 			c.Set("currentUser", currentUser)
 			if err != nil || currentUser == nil {
 				return c.NoContent(http.StatusUnauthorized)
@@ -545,9 +582,16 @@ func CorsHeader(next echo.HandlerFunc) echo.HandlerFunc {
 
 func main() {
 
-	db, err := sql.Open("sqlite3", "./db/8kur.db")
+	err := godotenv.Load()
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Error loading .env file")
+	}
+
+	ctx := context.Background()
+
+	db, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatalf("unable to create connection pool %v", err)
 	}
 	defer db.Close()
 

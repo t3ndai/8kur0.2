@@ -4,8 +4,8 @@ CREATE TABLE IF NOT EXISTS users(
     email varchar(255) unique not null,
     username varchar(255) unique not null,
     password_digest varchar(255) not null,
-    created_at datetime default current_timestamp,
-    updated_at datetime default current_timestamp
+    created_at timestamp default current_timestamp,
+    updated_at timestamp default current_timestamp
 )
 
 -- migrate:down
